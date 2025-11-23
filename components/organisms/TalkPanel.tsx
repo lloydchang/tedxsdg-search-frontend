@@ -17,6 +17,7 @@ import LoadingSpinner from './LoadingSpinner';
 import { debounce } from 'lodash';
 import styles from 'styles/components/organisms/TalkPanel.module.css';
 import { sdgTitleMap } from 'components/constants/sdgTitles';
+import { trace, Span } from '@opentelemetry/api';
 
 const isDevelopment = process.env.NODE_ENV === 'development';
 
@@ -40,10 +41,42 @@ const TalkPanel: React.FC = () => {
   const sentMessagesRef = useRef<Set<string>>(new Set());
   const scrollableContainerRef = useRef<HTMLDivElement>(null);
 
+  // Ref to track the active watch span
+  const activeWatchSpanRef = useRef<Span | null>(null);
+
   const debouncedPerformSearch = useCallback(
     debounce((query: string) => performSearch(query), 500),
     []
   );
+
+  // Manage video watch span
+  useEffect(() => {
+    const tracer = trace.getTracer('tedxsdg-search-frontend');
+
+    // End previous span if it exists
+    if (activeWatchSpanRef.current) {
+      activeWatchSpanRef.current.end();
+      activeWatchSpanRef.current = null;
+    }
+
+    // Start new span if a talk is selected
+    if (selectedTalk) {
+      const span = tracer.startSpan('watch_video');
+      span.setAttribute('video.title', selectedTalk.title);
+      span.setAttribute('video.presenter', selectedTalk.presenterDisplayName);
+      span.setAttribute('video.url', selectedTalk.url);
+      span.setAttribute('video.sdg_tags', selectedTalk.sdg_tags);
+      activeWatchSpanRef.current = span;
+    }
+
+    // Cleanup on unmount or when selectedTalk changes
+    return () => {
+      if (activeWatchSpanRef.current) {
+        activeWatchSpanRef.current.end();
+        activeWatchSpanRef.current = null;
+      }
+    };
+  }, [selectedTalk]);
 
   useEffect(() => {
     if (isDevelopment) {
@@ -71,48 +104,61 @@ const TalkPanel: React.FC = () => {
   }, []);
 
   const performSearch = async (query: string) => {
-    const trimmedQuery = query.trim().toLowerCase();
-    debugLog(`Performing search with query: "${trimmedQuery}"`);
+    const tracer = trace.getTracer('tedxsdg-search-frontend');
 
-    if (isSearchInProgress.current) {
-      debugLog('Search already in progress. Exiting.');
-      return;
-    }
+    await tracer.startActiveSpan('search_talks', async (span) => {
+      const trimmedQuery = query.trim().toLowerCase();
+      span.setAttribute('search.query', trimmedQuery);
+      debugLog(`Performing search with query: "${trimmedQuery}"`);
 
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = new AbortController();
-    isSearchInProgress.current = true;
-
-    dispatch(setLoading(true));
-    dispatch(setApiError(null));
-
-    try {
-      debugLog(`Making API request with query: "${trimmedQuery}"`);
-      const response = await axios.get(
-        `https://tedxsdg-search-backend.vercel.app/api/search?query=${encodeURIComponent(trimmedQuery)}`,
-        { signal: abortControllerRef.current.signal }
-      );
-
-      if (response.status !== 200) throw new Error(response.statusText);
-
-      const data: Talk[] = response.data.results.map((result: any) => ({
-        presenterDisplayName: result.document.presenterDisplayName || '',
-        title: result.document.slug.replace(/_/g, ' ') || '',
-        url: `https://www.ted.com/talks/${result.document.slug}`,
-        sdg_tags: result.document.sdg_tags || [],
-        transcript: result.document.transcript || '',
-      }));
-
-      if (!isStrictMode.current) handleSearchResults(data);
-    } catch (error) {
-      if (!axios.isCancel(error)) {
-        console.error('[performSearch] Error:', error);
-        dispatch(setApiError('Error fetching talks.'));
+      if (isSearchInProgress.current) {
+        debugLog('Search already in progress. Exiting.');
+        span.setAttribute('search.skipped', true);
+        span.end();
+        return;
       }
-    } finally {
-      dispatch(setLoading(false));
-      isSearchInProgress.current = false;
-    }
+
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = new AbortController();
+      isSearchInProgress.current = true;
+
+      dispatch(setLoading(true));
+      dispatch(setApiError(null));
+
+      try {
+        debugLog(`Making API request with query: "${trimmedQuery}"`);
+        const response = await axios.get(
+          `https://tedxsdg-search-backend.vercel.app/api/search?query=${encodeURIComponent(trimmedQuery)}`,
+          { signal: abortControllerRef.current.signal }
+        );
+
+        if (response.status !== 200) throw new Error(response.statusText);
+
+        const data: Talk[] = response.data.results.map((result: any) => ({
+          presenterDisplayName: result.document.presenterDisplayName || '',
+          title: result.document.slug.replace(/_/g, ' ') || '',
+          url: `https://www.ted.com/talks/${result.document.slug}`,
+          sdg_tags: result.document.sdg_tags || [],
+          transcript: result.document.transcript || '',
+        }));
+
+        span.setAttribute('search.results_count', data.length);
+
+        if (!isStrictMode.current) handleSearchResults(data);
+      } catch (error) {
+        if (!axios.isCancel(error)) {
+          console.error('[performSearch] Error:', error);
+          span.recordException(error as any);
+          dispatch(setApiError('Error fetching talks.'));
+        } else {
+          span.setAttribute('search.cancelled', true);
+        }
+      } finally {
+        dispatch(setLoading(false));
+        isSearchInProgress.current = false;
+        span.end();
+      }
+    });
   };
 
   const handleSearchResults = (data: Talk[]) => {
@@ -161,13 +207,24 @@ const TalkPanel: React.FC = () => {
   const openTranscriptInNewTab = () => {
     if (selectedTalk) {
       debugLog(`Opening transcript for: ${selectedTalk.title}`);
-      window.open(`${selectedTalk.url}/transcript?subtitle=en`, '_blank');
+      const tracer = trace.getTracer('tedxsdg-search-frontend');
+      tracer.startActiveSpan('open_transcript', (span) => {
+        span.setAttribute('video.title', selectedTalk.title);
+        span.setAttribute('video.url', selectedTalk.url);
+        window.open(`${selectedTalk.url}/transcript?subtitle=en`, '_blank');
+        span.end();
+      });
     }
   };
 
   const shuffleTalks = () => {
     debugLog('Shuffling talks.');
-    dispatch(setTalks(shuffleArray(talks)));
+    const tracer = trace.getTracer('tedxsdg-search-frontend');
+    tracer.startActiveSpan('shuffle_talks', (span) => {
+      span.setAttribute('talks.count', talks.length);
+      dispatch(setTalks(shuffleArray(talks)));
+      span.end();
+    });
   };
 
   return (
