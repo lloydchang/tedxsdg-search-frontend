@@ -15,6 +15,7 @@ import ChatInput from 'components/organisms/ChatInput';
 import Tools from 'components/organisms/Tools';
 import SpeechTest from 'components/atoms/SpeechTest';
 import { Message } from 'types';
+import { trace } from '@opentelemetry/api';
 
 const HeavyChatMessages = dynamic(() => import('components/molecules/ChatMessages'), {
   ssr: false,
@@ -40,12 +41,25 @@ const ChatPanel: React.FC = () => {
 
   const hasVisibleMessages = messages.some((message) => !message.hidden);
 
+
+
   const handleChat = useCallback(() => {
     const trimmedMessage = chatInput.trim();
     if (trimmedMessage) {
-      dispatch(sendMessage(trimmedMessage));
-      console.log('ChatPanel - Message sent:', trimmedMessage);
-      setChatInput('');
+      const tracer = trace.getTracer('tedxsdg-search-frontend');
+      tracer.startActiveSpan('send_message', async (span) => {
+        span.setAttribute('message.length', trimmedMessage.length);
+        try {
+          await dispatch(sendMessage(trimmedMessage));
+          console.log('ChatPanel - Message sent:', trimmedMessage);
+          setChatInput('');
+        } catch (error) {
+          span.recordException(error as any);
+          console.error('ChatPanel - Error sending message:', error);
+        } finally {
+          span.end();
+        }
+      });
     }
   }, [chatInput, dispatch]);
 
@@ -88,9 +102,8 @@ const ChatPanel: React.FC = () => {
 
   return (
     <div
-      className={`${styles.container} ${
-        isFullScreen ? styles.fullScreenMode : styles['Chat-panel']
-      }`}
+      className={`${styles.container} ${isFullScreen ? styles.fullScreenMode : styles['Chat-panel']
+        }`}
     >
       <Image
         src={BackgroundImage}
