@@ -43,6 +43,13 @@ const nextConfig = {
       use: 'null-loader',
     });
 
+    // Suppress warnings for require-in-the-middle and OpenTelemetry
+    config.ignoreWarnings = [
+      ...(config.ignoreWarnings || []),
+      { module: /require-in-the-middle/ },
+      { module: /@opentelemetry\/instrumentation/ },
+    ];
+
     return config;
   },
 };
